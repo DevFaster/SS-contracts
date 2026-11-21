@@ -55,7 +55,7 @@ validate_allowlist() {
 
     info "Validating $count allowlist entries..."
 
-    for i in $(seq 0 $((count - 1))); do
+    for i in $(seq 0 "$((count - 1))"); do
         local pattern
         local issue_id
         local expires
@@ -126,7 +126,7 @@ summarize_allowlist() {
     printf '%-4s %-40s %-15s %-12s %-20s %s\n' "IDX" "PATTERN (truncated)" "ISSUE_ID" "EXPIRES" "OWNER" "DESCRIPTION"
     printf '%-4s %-40s %-15s %-12s %-20s %s\n' "---" "----------------------------------------" "---------------" "------------" "--------------------" "-----------"
 
-    for i in $(seq 0 $((count - 1))); do
+    for i in $(seq 0 "$((count - 1))"); do
         local pattern
         local issue_id
         local expires

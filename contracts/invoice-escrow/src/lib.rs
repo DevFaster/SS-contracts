@@ -9,6 +9,7 @@
 mod buy_limit;
 mod collateral;
 mod custody;
+mod deprecation;
 mod errors;
 mod events;
 mod investor_cap;
@@ -383,10 +384,24 @@ impl InvoiceEscrow {
         Ok(config.penalty_interest_bps)
     }
 
+    /// View: return deprecation records for all deprecated entrypoints.
+    /// Returns a vector of deprecation metadata including replacement guidance.
+    pub fn get_deprecation_records(env: Env) -> soroban_sdk::Vec<deprecation::DeprecationRecord> {
+        deprecation::all_deprecation_records(&env)
+    }
+
+    /// View: check if a specific method is deprecated.
+    pub fn is_method_deprecated(env: Env, method: Symbol) -> bool {
+        deprecation::is_deprecated(&env, &method)
+    }
+
     /// Create a single-token escrow for legacy callers. Caller (seller) must be authenticated.
     /// face_value: what the debtor owes (amount to be paid at settlement)
     /// purchase_price: what the investor pays (discount applied here)
     /// commitment: immutable on-chain anchor (SHA-256 hash of off-chain invoice data)
+    ///
+    /// **Deprecated since v1.2.0**: Use `create_escrow` with `accepted_tokens` parameter for multi-token support.
+    /// This method will be removed in v2.0.0 (minimum 90-day warning period).
     pub fn create_escrow_legacy(
         env: Env,
         invoice_id: Symbol,
@@ -535,6 +550,9 @@ impl InvoiceEscrow {
     }
 
     /// Explicitly named alias for clients migrating from the legacy API.
+    ///
+    /// **Deprecated since v1.2.0**: Alias for `create_escrow`; use `create_escrow` directly.
+    /// This method will be removed in v2.0.0 (minimum 90-day warning period).
     pub fn create_escrow_with_tokens(
         env: Env,
         invoice_id: Symbol,
@@ -795,6 +813,9 @@ impl InvoiceEscrow {
 
     /// Fund the escrow (investor buys part or all of the invoice at purchase_price).
     /// Transfers `amount` from buyer to this contract. Multiple investors can fund until fully subscribed.
+    ///
+    /// **Deprecated since v1.2.0**: Use `fund_escrow` with `funding_token` parameter to specify the payment token explicitly.
+    /// This method will be removed in v2.0.0 (minimum 90-day warning period).
     pub fn fund_escrow_legacy(
         env: Env,
         invoice_id: Symbol,
@@ -818,6 +839,9 @@ impl InvoiceEscrow {
     }
 
     /// Explicitly named alias for clients migrating from the legacy API.
+    ///
+    /// **Deprecated since v1.2.0**: Alias for `fund_escrow`; use `fund_escrow` directly.
+    /// This method will be removed in v2.0.0 (minimum 90-day warning period).
     pub fn fund_escrow_with_token(
         env: Env,
         invoice_id: Symbol,
@@ -3123,6 +3147,39 @@ impl InvoiceEscrow {
     }
 
     /// Implement invoice settlement escrow release with on-time bonus distribution (#730)
+    fn record_fee_snapshot(
+        env: &Env,
+        invoice_id: &BytesN<32>,
+        category_fee_bps: u32,
+        platform_fee_bps: u32,
+        distributor_fee_bps: u32,
+    ) -> Result<FeeSnapshot, Error> {
+        if category_fee_bps > 10_000 || platform_fee_bps > 10_000 || distributor_fee_bps > 10_000 {
+            return Err(Error::InvalidFeeBps);
+        }
+        let effective_fee_bps = category_fee_bps;
+        let snapshot = FeeSnapshot {
+            category_fee_bps,
+            platform_fee_bps,
+            distributor_fee_bps,
+            effective_fee_bps,
+        };
+        let key = types::StorageKey::FeeSnap(invoice_id.clone());
+        let existed = env.storage().persistent().has(&key);
+        env.storage().persistent().set(&key, &snapshot);
+        if !existed {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&types::StorageKey::FeeSnapCnt)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&types::StorageKey::FeeSnapCnt, &(count + 1));
+        }
+        events::fee_snapshot_created(env, invoice_id, effective_fee_bps);
+        Ok(snapshot)
+    }
     pub fn release_escrow_with_bonus(
         env: Env,
         inv_id: u64,
@@ -3190,6 +3247,15 @@ pub mod oracle_adapter;
 
 #[cfg(test)]
 mod test_batch_features;
+
+#[cfg(test)]
+mod event_schema_tests;
+
+#[cfg(test)]
+mod auth_tests;
+
+#[cfg(test)]
+mod integration_fixtures;
 
 pub use earnest_deposit::{EarnestDeposit, EarnestDepositConfig, EarnestError, EarnestStatus};
 pub use insurance_pool::{InsuranceConfig, InsurancePool, InsuranceStorageKey};

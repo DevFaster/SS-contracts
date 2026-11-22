@@ -1108,6 +1108,10 @@ mod recovery_test {
 }
 
 #[cfg(test)]
+mod auth_tests;
+#[cfg(test)]
+mod event_schema_tests;
+#[cfg(test)]
 mod integration_test;
 #[cfg(test)]
 mod test;

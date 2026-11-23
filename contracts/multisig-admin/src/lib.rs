@@ -128,7 +128,7 @@ impl MultisigAdmin {
         let proposal = Proposal {
             id: proposal_id,
             proposer: proposer.clone(),
-            nonce,
+            nonce: nonce.clone(),
             action_type,
             params,
             approvals,

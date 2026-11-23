@@ -17,16 +17,16 @@ fn test_commitment(env: &Env) -> BytesN<32> {
     BytesN::from_array(env, &[0; 32])
 }
 
-fn sdk_i128_vec(env: &Env, values: &[i128]) -> Vec<i128> {
-    let mut result = Vec::new(env);
+fn sdk_i128_vec(env: &Env, values: &[i128]) -> soroban_sdk::Vec<i128> {
+    let mut result = soroban_sdk::Vec::new(env);
     for value in values {
         result.push_back(*value);
     }
     result
 }
 
-fn sdk_u32_vec(env: &Env, values: &[u32]) -> Vec<u32> {
-    let mut result = Vec::new(env);
+fn sdk_u32_vec(env: &Env, values: &[u32]) -> soroban_sdk::Vec<u32> {
+    let mut result = soroban_sdk::Vec::new(env);
     for value in values {
         result.push_back(*value);
     }

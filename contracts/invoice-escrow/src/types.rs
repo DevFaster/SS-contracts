@@ -79,6 +79,11 @@ pub enum StorageKey {
     FeeSnapCnt,
     /// Instance: maximum FX quote age for a currency.
     CurrencyMaxAge(soroban_sdk::Symbol),
+    /// Instance: generation of the active emergency multi-sig configuration. Bumped on every
+    /// `set_emergency_config`, so approvals made under an older configuration stop counting.
+    EmergencyGeneration,
+    /// Persistent: emergency-configuration generation that an invoice's approvals belong to.
+    EmergencyApprovalGen(soroban_sdk::Symbol),
 }
 
 /// Status and expiry details for a pending settlement proposal.
@@ -101,6 +106,7 @@ pub struct FeeSnapshot {
     pub distributor_fee_bps: u32,
     pub effective_fee_bps: u32,
 }
+
 /// Bounded allocation strategy for invoice funding fills.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -331,6 +337,16 @@ pub struct EscrowData {
 pub struct SettlementProposal {
     pub proposer: soroban_sdk::Address,
     pub repayment_amount: i128,
+}
+
+/// A pending settlement proposal plus the last ledger on which it can still be approved.
+/// Approval is allowed while `ledger.sequence() <= expires_at_ledger`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSettlement {
+    pub proposer: soroban_sdk::Address,
+    pub repayment_amount: i128,
+    pub expires_at_ledger: u32,
 }
 
 /// Status for BytesN<32> funding invoices (position management).

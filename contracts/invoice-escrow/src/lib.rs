@@ -22,7 +22,7 @@ use soroban_sdk::{
 };
 
 pub use types::MultiSigConfig;
-use types::SettlementProposal;
+use types::{PendingSettlement, SettlementProposal};
 
 // EscrowStatus is re-exported publicly; Config, EscrowData, and InvoiceData are crate-private.
 pub use types::AllocationPreview;
@@ -1233,16 +1233,21 @@ impl InvoiceEscrow {
 
             // 3. Pro-rata investor distribution with early repayment yield rebate
             if let Some(funder) = &data.funder {
+                // The investor side uses the penalty-adjusted amount. The penalty already
+                // went to the treasury above, so using the pre-penalty figure here would
+                // pay out the penalty a second time.
                 if data.funded_amt > 0 && final_investor_amount > 0 {
                     let funder_amt = storage::get_funder_amount(&env, invoice_id.clone(), funder);
                     let rebate = calculate_early_repayment_rebate(
                         current_ts,
                         data.due_dt,
                         data.funded_dt,
-                        investor_amount,
+                        final_investor_amount,
                     );
-                    let net_investor_amount =
-                        investor_amount.checked_sub(rebate).ok_or(Error::Overflow)?;
+                    let net_investor_amount = final_investor_amount
+                        .checked_sub(rebate)
+                        .ok_or(Error::Overflow)?
+                        .max(0);
                     let pro_rata_share = net_investor_amount
                         .checked_mul(funder_amt)
                         .ok_or(Error::Overflow)?
@@ -1652,7 +1657,22 @@ impl InvoiceEscrow {
         if config.threshold == 0 || config.threshold > config.admins.len() {
             return Err(Error::InvalidFeeBps); // reuse for invalid threshold
         }
+        // Every member must be a real account, and no member may appear twice. A duplicate
+        // would let one signer count toward the threshold more than once.
+        let len = config.admins.len();
+        for i in 0..len {
+            let member = config.admins.get(i).ok_or(Error::InvalidAddress)?;
+            ensure_non_zero_address(&env, &member)?;
+            for j in (i + 1)..len {
+                let other = config.admins.get(j).ok_or(Error::InvalidAddress)?;
+                if other == member {
+                    return Err(Error::DuplicateEmergencyAdmin);
+                }
+            }
+        }
         storage::set_emergency_config(&env, &config);
+        // Approvals collected under the previous membership or threshold stop counting.
+        storage::bump_emergency_generation(&env);
         Ok(())
     }
 
@@ -1675,7 +1695,8 @@ impl InvoiceEscrow {
             return Err(Error::NotEmergencyAdmin);
         }
 
-        let mut approvals = storage::get_emergency_approvals(&env, &invoice_id);
+        // Only approvals made under the active configuration generation are counted.
+        let mut approvals = storage::get_current_emergency_approvals(&env, &invoice_id);
 
         // Check for duplicate approval
         for addr in approvals.approvals.iter() {
@@ -2239,8 +2260,10 @@ impl InvoiceEscrow {
                     return Err(Error::InvalidAmount);
                 }
             }
+            // Hard cap: the same source `top_up` and `get_remaining_capacity` use.
+            // `funding_target` only drives reporting and does not limit acceptance.
             let remaining = invoice
-                .funding_target
+                .max_funding_threshold
                 .checked_sub(invoice.total_raised)
                 .ok_or(Error::Overflow)?;
             if remaining == 0 {
@@ -2343,11 +2366,13 @@ impl InvoiceEscrow {
         Ok(())
     }
 
-    /// Return the amount still available for investment before the funding cap.
+    /// Return the amount still available for investment before the hard cap
+    /// (`max_funding_threshold` for funding invoices). This equals the most that the next
+    /// `invest`, `invest_with_currency` or `top_up` call can accept.
     pub fn get_remaining_capacity(env: Env, invoice_id: BytesN<32>) -> Result<i128, Error> {
         if let Some(invoice) = storage::get_invoice(&env, invoice_id.clone()) {
             return invoice
-                .funding_target
+                .max_funding_threshold
                 .checked_sub(invoice.total_raised)
                 .ok_or(Error::Overflow);
         }
@@ -2634,8 +2659,18 @@ impl InvoiceEscrow {
         if multisig.threshold != 2 || !multisig.admins.iter().any(|member| member == *admin) {
             return Err(Error::NotEmergencyAdmin);
         }
-        if storage::get_settlement_proposal(env, invoice_id).is_some() {
-            return Err(Error::InvalidInvoiceStatus);
+        if let Some(existing) = storage::get_settlement_proposal(env, invoice_id) {
+            if !Self::settlement_expired(env, invoice_id) {
+                return Err(Error::InvalidInvoiceStatus);
+            }
+            // The stored proposal has passed its window. Clear it so a new one can be made.
+            Self::clear_settlement(env, invoice_id);
+            events::settlement_expired(
+                env,
+                invoice_id,
+                &existing.proposer,
+                existing.repayment_amount,
+            );
         }
         storage::set_settlement_proposal(
             env,
@@ -2659,6 +2694,83 @@ impl InvoiceEscrow {
         Ok(())
     }
 
+    /// Ledger on which the pending proposal for this invoice stops being approvable.
+    fn settlement_expires_at(env: &Env, invoice_id: &BytesN<32>) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&types::StorageKey::SettleExp(invoice_id.clone()))
+    }
+
+    /// A proposal is expired once the ledger sequence is past its expiry ledger.
+    fn settlement_expired(env: &Env, invoice_id: &BytesN<32>) -> bool {
+        match Self::settlement_expires_at(env, invoice_id) {
+            Some(expires_at) => env.ledger().sequence() > expires_at,
+            None => false,
+        }
+    }
+
+    /// Remove the pending proposal and its expiry record. Deposited repayment is not touched.
+    fn clear_settlement(env: &Env, invoice_id: &BytesN<32>) {
+        storage::remove_settlement_proposal(env, invoice_id);
+        env.storage()
+            .persistent()
+            .remove(&types::StorageKey::SettleExp(invoice_id.clone()));
+    }
+
+    /// View: the pending settlement proposal and its approval deadline.
+    pub fn get_pending_settlement(
+        env: Env,
+        invoice_id: BytesN<32>,
+    ) -> Result<PendingSettlement, Error> {
+        let proposal = storage::get_settlement_proposal(&env, &invoice_id)
+            .ok_or(Error::SettlementNotProposed)?;
+        let expires_at_ledger =
+            Self::settlement_expires_at(&env, &invoice_id).ok_or(Error::SettlementNotProposed)?;
+        Ok(PendingSettlement {
+            proposer: proposal.proposer,
+            repayment_amount: proposal.repayment_amount,
+            expires_at_ledger,
+        })
+    }
+
+    /// Cancel a pending settlement proposal. The original proposer or the current
+    /// administrator may cancel; anyone else gets `Unauthorized` and the proposal is kept.
+    /// The invoice stays `Funded` and deposited repayment is not moved.
+    pub fn cancel_settlement(
+        env: Env,
+        caller: Address,
+        invoice_id: BytesN<32>,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let config = storage::get_config(&env).ok_or(Error::NotInit)?;
+        let proposal = storage::get_settlement_proposal(&env, &invoice_id)
+            .ok_or(Error::SettlementNotProposed)?;
+        if caller != proposal.proposer && caller != config.admin {
+            return Err(Error::Unauthorized);
+        }
+        Self::clear_settlement(&env, &invoice_id);
+        events::settlement_cancelled(&env, &invoice_id, &caller, proposal.repayment_amount);
+        Ok(())
+    }
+
+    /// Clear a pending settlement proposal whose approval window has passed. Anyone may call
+    /// this. It moves no funds and does not finalise the invoice; a new proposal can then be made.
+    pub fn expire_settlement(env: Env, invoice_id: BytesN<32>) -> Result<(), Error> {
+        let proposal = storage::get_settlement_proposal(&env, &invoice_id)
+            .ok_or(Error::SettlementNotProposed)?;
+        if !Self::settlement_expired(&env, &invoice_id) {
+            return Err(Error::SettlementNotExpired);
+        }
+        Self::clear_settlement(&env, &invoice_id);
+        events::settlement_expired(
+            &env,
+            &invoice_id,
+            &proposal.proposer,
+            proposal.repayment_amount,
+        );
+        Ok(())
+    }
+
     /// Approve and execute a proposed settlement. The proposer cannot approve
     /// their own proposal, and the approval set is always exactly two admins.
     pub fn approve_settlement(
@@ -2673,14 +2785,8 @@ impl InvoiceEscrow {
         }
         let proposal = storage::get_settlement_proposal(&env, &invoice_id)
             .ok_or(Error::SettlementNotProposed)?;
-        if let Some(expires_at) = env
-            .storage()
-            .persistent()
-            .get::<types::StorageKey, u32>(&types::StorageKey::SettleExp(invoice_id.clone()))
-        {
-            if env.ledger().sequence() > expires_at {
-                return Err(Error::SettlementProposalExpired);
-            }
+        if Self::settlement_expired(&env, &invoice_id) {
+            return Err(Error::SettlementProposalExpired);
         }
         if proposal.proposer == admin {
             return Err(Error::SameAdminApproval);
@@ -3000,7 +3106,7 @@ impl InvoiceEscrow {
         }
         let strategy = Self::get_allocation_strategy(env.clone(), invoice_id.clone());
         let mut remaining = invoice
-            .funding_target
+            .max_funding_threshold
             .checked_sub(invoice.total_raised)
             .ok_or(Error::Overflow)?;
         if remaining <= 0 {
@@ -3090,7 +3196,7 @@ impl InvoiceEscrow {
             storage::get_invoice(&env, invoice_id.clone()).ok_or(Error::EscrowNotFound)?;
         let strategy = Self::get_allocation_strategy(env.clone(), invoice_id.clone());
         let initial_remaining = invoice
-            .funding_target
+            .max_funding_threshold
             .checked_sub(invoice.total_raised)
             .ok_or(Error::Overflow)?;
 
@@ -3180,6 +3286,8 @@ impl InvoiceEscrow {
         events::fee_snapshot_created(env, invoice_id, effective_fee_bps);
         Ok(snapshot)
     }
+
+    /// Implement invoice settlement escrow release with on-time bonus distribution (#730)
     pub fn release_escrow_with_bonus(
         env: Env,
         inv_id: u64,
@@ -3250,6 +3358,8 @@ mod test_batch_features;
 
 #[cfg(test)]
 mod event_schema_tests;
+#[cfg(test)]
+mod settlement_emergency_tests;
 
 #[cfg(test)]
 mod auth_tests;
